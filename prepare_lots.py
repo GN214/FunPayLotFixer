@@ -281,17 +281,37 @@ def build_emoji_rotation(donor_emojis):
         if not placed:
             rot[old] = ""  # исчерпали всё — символ просто вырезается
     EMOJI_ROTATION = rot
-    BRAND_ONLY_EMOJIS = set()
-    for v in rot.values():
+    # Множество «фирменных» символов строится из ВСЕХ целей таблицы ротации,
+    # а не только из реально применённых (rot): иначе символ маски, который
+    # встретился в исходном тексте заголовка (не в составе донорского маркера),
+    # не вырезался и оставался как артефакт.
+    BRAND_ONLY_EMOJIS = {"\uFE0F"}
+    for v in table.values():
         if v:
             BRAND_ONLY_EMOJIS.add(v)
             BRAND_ONLY_EMOJIS.add(v.replace("\uFE0F", ""))
-    BRAND_ONLY_EMOJIS.add("\uFE0F")
     # sanity: инъективность и непересечение целей с донором
     finals = [v for v in rot.values() if v]
     assert len(finals) == len(set(finals)), "Ротация не инъективна!"
     assert not (set(finals) & donor_emojis), "Цель ротации = донорский символ!"
     return rot
+
+
+# Символы, которые НИКОГДА нельзя вырезать из текста заголовка: буквенно-
+# цифровые символы (латиница/кириллица/цифры), пробелы и обычная пунктуация.
+# Раньше «вырезание остаточных символов маски» проходило по всему тексту —
+# если цель ротации случайно совпадала с базовым кодом буквы (например,
+# U+1F30F «🌏» как одиночный символ), из заголовка исчезали буквы
+# («First Light» -> «Firs Light»). Теперь вырезаются только настоящие
+# эмодзи-символы (вне BMP), а текст защищён.
+_PROTECTED_TEXT_RANGES = ((0x21, 0x7E),        # ASCII печать + пробел
+                          (0xA0, 0x2FF),       # латиница-расш., кириллица, общ. пиктогр.
+                          (0x370, 0x24FF))     # греческий и далее до CJK (без эмодзи-BMP)
+
+
+def _is_protected_text(ch):
+    cp = ord(ch)
+    return any(a <= cp <= b for a, b in _PROTECTED_TEXT_RANGES)
 
 
 def uniquify_summary_emojis(s):
@@ -302,14 +322,34 @@ def uniquify_summary_emojis(s):
     for i, part in enumerate(parts):
         out.append(part)
         if i < len(marks):
+            # FE0F/ZWJ — не самостоятельные маркеры: они приклеятся к цели
+            # предыдущего символа (или будут удалены ниже).
+            if marks[i] in ("\uFE0F", "\u200D"):
+                continue
             out.append(EMOJI_ROTATION.get(marks[i], ""))
     s = "".join(out)
-    # вырезание любых остаточных символов маски из текстового содержимого
-    s = "".join(ch for ch in s if ch not in BRAND_ONLY_EMOJIS)
+    # Вырезание любых остаточных символов маски из ТЕКСТОВОГО содержимого.
+    # Защита от «поедания» текста: вырезаются только настоящие эмодзи-символы
+    # (>0x2FFF), при этом одиночные символы маски (без \\uFE0F, напр. 🌤/🌨)
+    # удаляются лишь в том случае, если в строке есть их полная версия с
+    # FE0F — иначе это исходный текст донора (например, solitary «🌤»).
+    # Буквы / цифры / пробелы / пунктуация удалению не подлежат — иначе из
+    # заголовка исчезали символы текста («First Light» -> «Firs Light»).
+    def _should_strip(ch):
+        if ord(ch) <= 0x24FF or ch not in BRAND_ONLY_EMOJIS:
+            return False
+        if ch == "\uFE0F":
+            return True
+        full = ch + "\uFE0F"
+        if full in BRAND_ONLY_EMOJIS and full in s:
+            return False   # это «половинка» полной цели ротации — не трогать
+        return True
+
+    s = "".join(ch for ch in s if not _should_strip(ch))
     # схлопывание идущих подряд одинаковых маркеров и двойных пробелов
-    s = re.sub(r"(?:‼️){2,}", "‼️", s)
+    s = re.sub(r"(?:\u203C\uFE0F){2,}", "\u203C\uFE0F", s)   # ‼️‼️... -> ‼️
     s = re.sub(r"([^\s])\1{2,}", r"\1\1", s)
-    s = re.sub(r"[ \\t]{2,}", " ", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
     return s
 
 
