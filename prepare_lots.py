@@ -19,6 +19,7 @@ import re
 import sys
 import time
 import csv
+from os.path import exists
 
 random.seed(42)  # детерминированная рандомизация amount
 
@@ -145,7 +146,8 @@ EN_BADGES = [
 #     кластеры-«скобки» уравновешиваются парной копией («Xтекст» -> «XтекстX»).
 
 EMOJI_CHAR_CLASS = ("\U0001F000-\U0001FAFF\U00002600-\U000027BF"
-                    "\U00002B00-\U00002BFF\uFE0F\u200D")
+                    "\U00002B00-\U00002BFF\u203C\u2049\u23F3"
+                    "\u25B2-\u25FE\uFE0F\u200D")
 _SUMMARY_EMOJI_RE = re.compile("[" + EMOJI_CHAR_CLASS + "]")
 _CLUSTER_RE = re.compile("[" + EMOJI_CHAR_CLASS + "]+")
 _REGIONAL_INDICATOR_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
@@ -509,6 +511,10 @@ def get_game_name(item, lang="ru"):
         "digital key", "цифровой ключ", "цифровой код", "код активации",
         "fast delivery", "быстрая выдача", "быстрая доставка",
         "fast and secure", "быстро и безопасно", "safe", "безопасно",
+        "автовыдача", "авто выдача", "auto", "auto release", "delivery",
+        "key", "ключ", "gift", "подарок", "currency", "валюта",
+        "subscription", "подписка", "top up", "пополнение", "coins",
+        "монет", "token", "токен", "diamond", "алмаз",
         "any region", "любой регион", "global", "global region",
         "gift card", "подарочная карта", "карта оплаты", "activation code",
         "ready account", "готовый аккаунт", "clean account", "чистый аккаунт",
@@ -542,7 +548,7 @@ def get_game_name(item, lang="ru"):
                 "",
                 text,
                 flags=re.I,
-            ).strip()
+            ).strip(" \t-–—:|")
             compact = re.sub(r"[\W_]+", " ", text.casefold()).strip()
             if (len(text) <= 2 or not re.search(r"[^\W\d_]", text, re.UNICODE)
                     or re.fullmatch(r"[\d\s.,+/]+", text)
@@ -1299,10 +1305,12 @@ def write_audit_report(items, path=AUDIT_FILE):
     quarantine_flags = inversion_check(items)
     region_aliases = {
         "россия": "Россия", "russia": "Россия", "рф": "Россия",
+        "ru": "Россия",
         "украина": "Украина", "ukraine": "Украина",
         "турция": "Турция", "turkey": "Турция",
         "казахстан": "Казахстан", "kazakhstan": "Казахстан",
         "беларусь": "Беларусь", "belarus": "Беларусь",
+        "снг": "СНГ", "cis": "СНГ",
         "польша": "Польша", "poland": "Польша",
         "сша": "США", "usa": "США",
         "аргентина": "Аргентина", "argentina": "Аргентина",
@@ -1316,10 +1324,12 @@ def write_audit_report(items, path=AUDIT_FILE):
         re.I,
     )
     columns = (
-        "source_index", "node_id", "review_reasons", "quarantine_reason",
+        "dataset", "record_index", "source_index", "node_id",
+        "review_reasons", "quarantine_reason",
         "template_candidate", "fields[method]", "fields[type]",
         "fields[platform]", "fields[region]", "fields[region2]", "price",
         "duplicate_variation_fields", "detected_game_ru", "detected_game_en",
+        "description_game_ru", "description_game_en", "description_product_en",
         "fields[summary][ru]", "fields[summary][en]",
     )
     rows = []
@@ -1384,6 +1394,8 @@ def write_audit_report(items, path=AUDIT_FILE):
         if reasons:
             bucket_reason = quarantine_reason(item) or quarantine_flags.get(id(item), "")
             rows.append({
+                "dataset": "source_dump",
+                "record_index": index,
                 "source_index": index,
                 "node_id": item.get("node_id", ""),
                 "review_reasons": " | ".join(dict.fromkeys(reasons)),
@@ -1398,9 +1410,67 @@ def write_audit_report(items, path=AUDIT_FILE):
                 "duplicate_variation_fields": ", ".join(varied_by_index.get(index, [])),
                 "detected_game_ru": game_ru,
                 "detected_game_en": game_en,
+                "description_game_ru": "",
+                "description_game_en": "",
+                "description_product_en": "",
                 "fields[summary][ru]": ru_title,
                 "fields[summary][en]": en_title,
             })
+
+    for filename in (READY_FILE, QUARANTINE_FILE):
+        if not exists(filename):
+            continue
+        with open(filename, encoding="utf-8") as artifact:
+            artifact_items = json.load(artifact)
+        for index, item in enumerate(artifact_items):
+            desc_ru = item.get("fields[desc][ru]", "") or ""
+            desc_en = item.get("fields[desc][en]", "") or ""
+            game_ru_match = re.search(r"🔹\s*Игра:\s*([^\n]+)", desc_ru)
+            game_en_match = re.search(r"🔹\s*Game:\s*([^\n]+)", desc_en)
+            product_en_match = re.search(r"🔹\s*Product:\s*([^\n]+)", desc_en)
+            desc_game_ru = game_ru_match.group(1).strip() if game_ru_match else ""
+            desc_game_en = game_en_match.group(1).strip() if game_en_match else ""
+            product_en = product_en_match.group(1).strip() if product_en_match else ""
+            reasons = []
+            for lang, game in (("RU", desc_game_ru), ("EN", desc_game_en)):
+                if game and re.search(
+                        r"быстр|безопас|достав|аккаунт|подарок|ключ|регион|"
+                        r"global|steam|xbox|ps[45]|ea app|fast|safe|delivery",
+                        game, re.I):
+                    reasons.append(f"В текущем {lang}-описании в поле «Игра» указана характеристика: {game}")
+            if re.search(r"[А-Яа-яЁё]", desc_en + product_en):
+                reasons.append("В текущем EN-описании остался текст на кириллице")
+            method = item.get("fields[method]", "")
+            if method == "Подарочная карта" and re.search(
+                    r"данные для входа|login credentials|provide your login",
+                    desc_ru + " " + desc_en, re.I):
+                reasons.append("Описание подарочной карты ошибочно запрашивает данные для входа")
+            if method in ("Пополнение по ID", "Готовый аккаунт"):
+                reasons.append("Для способа продажи пока не утверждён подходящий шаблон")
+            if reasons:
+                rows.append({
+                    "dataset": filename,
+                    "record_index": index,
+                    "source_index": "",
+                    "node_id": item.get("node_id", ""),
+                    "review_reasons": " | ".join(dict.fromkeys(reasons)),
+                    "quarantine_reason": "",
+                    "template_candidate": route_template(item),
+                    "fields[method]": method,
+                    "fields[type]": item.get("fields[type]", ""),
+                    "fields[platform]": item.get("fields[platform]", ""),
+                    "fields[region]": item.get("fields[region]", ""),
+                    "fields[region2]": item.get("fields[region2]", ""),
+                    "price": item.get("price", ""),
+                    "duplicate_variation_fields": "",
+                    "detected_game_ru": get_game_name(item, "ru"),
+                    "detected_game_en": get_game_name(item, "en"),
+                    "description_game_ru": desc_game_ru,
+                    "description_game_en": desc_game_en,
+                    "description_product_en": product_en,
+                    "fields[summary][ru]": item.get("fields[summary][ru]", ""),
+                    "fields[summary][en]": item.get("fields[summary][en]", ""),
+                })
 
     with open(path, "w", encoding="utf-8-sig", newline="") as report:
         writer = csv.DictWriter(report, fieldnames=columns)
