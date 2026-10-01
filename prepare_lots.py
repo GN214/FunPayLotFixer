@@ -18,19 +18,21 @@ import random
 import re
 import sys
 import time
+import csv
+from os.path import exists
 
 random.seed(42)  # детерминированная рандомизация amount
 
 INPUT_FILE = "profile_6557050.json"
 READY_FILE = "lots_ready.json"
 QUARANTINE_FILE = "lots_quarantine.json"
+AUDIT_FILE = "lots_audit.csv"
 MAX_FILE_SIZE = 20971520  # ограничение плагина copy_lots_plugin.py
 SUMMARY_LIMIT = 100       # FunPay LotSavingError при summary > 100 символов
 
 NOW_TS = str(int(time.time()))
 
 TEXT_KEYS = (
-    "fields[summary][ru]", "fields[summary][en]",
     "fields[desc][ru]", "fields[desc][en]",
     "fields[payment_msg][ru]", "fields[payment_msg][en]",
 )
@@ -144,10 +146,12 @@ EN_BADGES = [
 #     кластеры-«скобки» уравновешиваются парной копией («Xтекст» -> «XтекстX»).
 
 EMOJI_CHAR_CLASS = ("\U0001F000-\U0001FAFF\U00002600-\U000027BF"
-                    "\U00002B00-\U00002BFF\uFE0F\u200D")
+                    "\U00002B00-\U00002BFF\u203C\u2049\u23F3"
+                    "\u25B2-\u25FE\uFE0F\u200D")
 _SUMMARY_EMOJI_RE = re.compile("[" + EMOJI_CHAR_CLASS + "]")
 _CLUSTER_RE = re.compile("[" + EMOJI_CHAR_CLASS + "]+")
 _REGIONAL_INDICATOR_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
+DUP_MARKS = ("‼️", "◾", "🫧", "📿")
 
 
 def _donor_summary_emoji_inventory(items):
@@ -362,10 +366,8 @@ def uniquify_summary_emojis(s):
     """Полная ротация донорской эмодзи-палитры заголовка в фирменную маску."""
     s = _rotate_clusters(s)
     s = _strip_flag_pairs(s)
-    # схлопывание идущих подряд одинаковых маркеров и двойных пробелов
+    # схлопывание только повторяющихся emoji-маркеров
     s = re.sub(r"(?:\u203C\uFE0F){2,}", "\u203C\uFE0F", s)   # ‼️‼️... -> ‼️
-    s = re.sub(r"([^\s])\1{2,}", r"\1\1", s)
-    s = re.sub(r"[ \t]{2,}", " ", s)
     # УРАВНОВЕШИВАНИЕ незакрытых кластеров-«скобок»: там, где донор ставил
     # одиночный открывающий маркер (💚Xbox), после ротации добавляем парную
     # закрывающую копию (🧡Xbox🧡). Кластеры, которые донор сам удваивал
@@ -414,34 +416,15 @@ def uniquify_summary_emojis(s):
 def transform_summary(s, lang):
     if not s:
         return s
-    for old, new in (RU_BADGES if lang == "ru" else EN_BADGES):
-        s = s.replace(old, new)
     # полная ротация донорской палитры -> индивидуальная маска магазина
     s = uniquify_summary_emojis(s)
-    # --- контроль длины <= 100 -------------------------------------------
-    if len(s) > SUMMARY_LIMIT:
-        # шаг 1: сворачиваем дублирующиеся парные эмодзи-маркеры
-        s = re.sub(r"(?:‼️){2,}", "‼️", s)
-        s = re.sub(r"(?:◾){2,}", "◾", s)
-        s = re.sub(r"(?:🫧){2,}", "🫧", s)
-        s = re.sub(r"(?:📿){2,}", "📿", s)
-    if len(s) > SUMMARY_LIMIT:
-        # шаг 2: сокращаем хвостовые плашки
-        s = s.replace("🧡[Быстро и Безопасно]🧡", "🧡[Безопасно]🧡")
-        s = s.replace("🛡️[Безопасно/Официально]🛡️", "🛡️[Безопасно]🛡️")
-        s = s.replace("🛡️[Safe/Official]🛡️", "🛡️[Safe]🛡️")
-        s = s.replace("[БЫСТРО И БЕЗОПАСНО]", "[БЕЗОПАСНО]")
-        s = s.replace("🧡[Быстрая и Безопасная выдача]🧡", "🧡[Быстро]🧡")
-        s = s.replace("🧡[Fast & Safe Delivery]🧡", "🧡[Fast]🧡")
-    if len(s) > SUMMARY_LIMIT:
-        # шаг 3: удаляем вторые пары маркеров вокруг одинаковых сегментов
-        for mark in DUP_MARKS:
-            while len(s) > SUMMARY_LIMIT and s.count(mark) >= 2:
-                idx = s.rfind(mark)
-                s = s[:idx] + s[idx + len(mark):]
-    if len(s) > SUMMARY_LIMIT:
-        # шаг 4: гарантированная подрезка по символам
-        s = s[:SUMMARY_LIMIT].rstrip()
+    # Сохраняем весь текст заголовка; при превышении лимита удаляем только emoji.
+    while len(s) > SUMMARY_LIMIT:
+        marks = list(_CLUSTER_RE.finditer(s))
+        if not marks:
+            break
+        match = marks[-1]
+        s = s[:match.start()] + s[match.end():]
     return s
 
 
@@ -488,6 +471,8 @@ def bracket_segments(s):
 def get_region_ru(item):
     r = item.get("fields[region]") or item.get("fields[region2]") or ""
     if r:
+        if r.casefold() in ("любой", "любой регион", "any region", "global"):
+            return "Любой регион"
         return r
     segs = bracket_segments(item.get("fields[summary][ru]", ""))
     known = set(REGION_RU_EN) | {"Любой Регион", "Global", "GLOBAL", "СНГ"}
@@ -497,10 +482,16 @@ def get_region_ru(item):
     return "Любой регион"
 
 
-def get_platform(item):
-    node = item.get("node_id")
-    if node == "2681":
-        return "PS5"
+def get_platform(item, lang="ru"):
+    field_platform = (item.get("fields[platform]") or "").strip()
+    if field_platform:
+        if lang == "en":
+            return {
+                "PS": "PlayStation",
+                "Стим": "Steam",
+                "Подарком": "Gift",
+            }.get(field_platform, field_platform)
+        return field_platform
     text = (item.get("fields[summary][ru]", "") + " " +
             item.get("fields[summary][en]", "")).upper()
     for w in PLATFORM_WORDS:
@@ -509,46 +500,66 @@ def get_platform(item):
                     "PS4": "PS4", "PS5": "PS5"}.get(w, w)
     if "STEAM" in text:
         return "Steam"
-    return "Steam"
+    return ""
 
 
-def get_game_name(item):
+def get_game_name(item, lang="ru"):
     ru = item.get("fields[summary][ru]", "")
     en = item.get("fields[summary][en]", "")
-    noise = {"steam подарок", "steam gift", "steam", "цифровой ключ", "ключ",
-             "global", "любой регион", "быстрая выдача", "fast delivery",
-             "безопасно", "safe", "official purchase", "готовый аккаунт",
-             "ready account", "чистый", "deluxe edition", "standard edition",
-             "premium edition", "gold edition", "any region", "на ваш аккаунт",
-             "to your account", "подарочная карта", "карта оплаты", "gift card",
-             "app store", "код активации", "activation code", "ps5", "ps4",
-             "xbox", "pc", "epic games", "ea app", "battle.net", "cisdll",
-             "россия", "украина", "турция", "казахстан", "беларусь", "аргентина",
-             "индия", "бразилия", "польша", "сша", "snk", "russia", "ukraine",
-             "turkey", "kazakhstan", "belarus", "argentina", "india", "brazil",
-             "poland", "usa", "cis", "new", "any pack", "любой предмет",
-             "боевой пропуск", "battle pass", "digital key", "steam ключ"}
-    editions = ("standard", "deluxe", "premium", "gold", "ultimate", "collector",
-                "legendary", "complete", "pro", "plus", "basic")
-    for src in (ru, en):
-        for s in bracket_segments(src):
-            t = s.strip()
-            low = t.lower()
-            if not t or low in noise:
+    noise = (
+        "steam gift", "steam подарок", "steam key", "steam ключ",
+        "digital key", "цифровой ключ", "цифровой код", "код активации",
+        "fast delivery", "быстрая выдача", "быстрая доставка",
+        "fast and secure", "быстро и безопасно", "safe", "безопасно",
+        "автовыдача", "авто выдача", "auto", "auto release", "delivery",
+        "key", "ключ", "gift", "подарок", "currency", "валюта",
+        "subscription", "подписка", "top up", "пополнение", "coins",
+        "монет", "token", "токен", "diamond", "алмаз",
+        "any region", "любой регион", "global", "global region",
+        "gift card", "подарочная карта", "карта оплаты", "activation code",
+        "ready account", "готовый аккаунт", "clean account", "чистый аккаунт",
+        "to your account", "на ваш аккаунт", "any pack", "любой предмет",
+        "battle pass", "боевой пропуск", "ea app", "epic games",
+        "battle.net", "steam", "xbox", "ps4", "ps5", "psn", "pc",
+        "россия", "украина", "турция", "казахстан", "беларусь",
+        "аргентина", "индия", "бразилия", "польша", "сша", "russia",
+        "ukraine", "turkey", "kazakhstan", "belarus", "argentina",
+        "india", "brazil", "poland", "usa", "cis", "europe",
+        "standard", "deluxe", "premium", "gold edition", "ultimate",
+        "collector", "legendary", "complete edition", "edition",
+        "версия", "издание", "аккаунт", "регион",
+    )
+    promo_prefix = re.compile(
+        r"^(?:pre[- ]?purchase|предзаказ|быстрая выдача|fast delivery|"
+        r"куплю|покупка сразу|dLC\s*)\s*[-:|]*\s*",
+        re.I,
+    )
+
+    def candidates(src):
+        parts = bracket_segments(src) + _SUMMARY_EMOJI_RE.split(src)
+        for part in parts:
+            text = re.sub(r"[\[\]]", " ", part)
+            text = re.sub(r"[•·|]+", " ", text)
+            text = re.sub(r"\s+", " ", text).strip(" \t-–—:|")
+            text = promo_prefix.sub("", text).strip(" \t-–—:|")
+            text = re.sub(
+                r"\s+(?:standard|deluxe|premium|gold|ultimate|"
+                r"collector'?s|legendary|complete)\s+(?:edition|version)$",
+                "",
+                text,
+                flags=re.I,
+            ).strip(" \t-–—:|")
+            compact = re.sub(r"[\W_]+", " ", text.casefold()).strip()
+            if (len(text) <= 2 or not re.search(r"[^\W\d_]", text, re.UNICODE)
+                    or re.fullmatch(r"[\d\s.,+/]+", text)
+                    or any(token in compact for token in noise)):
                 continue
-            if any(w in low for w in editions):
-                continue
-            if re.fullmatch(r"[\d\s.,+/]+", t):
-                continue
-            if len(t) <= 2:
-                continue
-            return t
-        # без скобок: первое содержательное слово-фраза
-        tokens = [w for w in re.split(r"[•·|]+|\s{2,}", src) if w.strip()]
-        for tk in tokens:
-            t = re.sub(r"[^\w:.®\- ]", "", tk, flags=re.UNICODE).strip()
-            if len(t) > 3 and t.lower() not in noise:
-                return t
+            yield text
+
+    sources = (en, ru) if lang == "en" else (ru, en)
+    for src in sources:
+        for candidate in candidates(src):
+            return candidate
     return "указанный в заголовке лота товар"
 
 
@@ -921,20 +932,26 @@ def route_template(item):
             return "7B"
         if "официальный ключ" in both:
             return "7V"
+    if method in ("Пополнение по ID", "Готовый аккаунт"):
+        return "REVIEW"
+    if method == "Подарочная карта":
+        return "6"
+    if method in ("Цифровой ключ", "Цифровой код"):
+        return "5"
+    if method == "Подарком":
+        return "1"
+    if method == "С заходом на аккаунт":
+        return "2"
     if "любой предмет" in ru or "any pack" in both:
         return "8"
     if "готовый аккаунт" in both or "ready account" in both:
         return "3"
-    if method == "Подарком" or "steam подарок" in both or "steam gift" in both:
+    if "steam подарок" in both or "steam gift" in both:
         return "1"
-    if "currency" in item or node == "1316":
+    if "fields[currency]" in item or node == "1316":
         return "6"
-    if method in ("Цифровой ключ", "Цифровой код"):
-        return "5"
     if "quantity" in item or node in DONATE_NODES:
         return "4"
-    if method == "С заходом на аккаунт":
-        return "2"
     return "2"
 
 
@@ -983,10 +1000,10 @@ def key_region_info(item):
 
 
 def build_desc(item, tpl, lang):
-    game = get_game_name(item)
+    game = get_game_name(item, lang)
     edition = get_edition(item)
     item_name = get_item_name(item)
-    platform = get_platform(item)
+    platform = get_platform(item, lang)
     region_ru = get_region_ru(item)
     region_en = REGION_RU_EN.get(region_ru, region_ru)
     cur = item.get("fields[currency]", "")
@@ -1255,6 +1272,213 @@ def inversion_check(items):
     return flagged
 
 
+def write_audit_report(items, path=AUDIT_FILE):
+    """Пишет CSV с исходными данными лотов, требующими ручной сверки."""
+    def norm_ws(text):
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    duplicate_groups = {}
+    for index, item in enumerate(items):
+        key = (item.get("node_id"),
+               norm_ws(item.get("fields[summary][ru]")),
+               norm_ws(item.get("fields[region]") or item.get("fields[region2]")))
+        duplicate_groups.setdefault(key, []).append(index)
+
+    varied_by_index = {}
+    important_fields = (
+        "price", "fields[type]", "fields[method]", "fields[platform]",
+        "fields[region]", "fields[region2]", "fields[quantity]", "fields[time]",
+        "fields[currency]", "fields[rub]", "fields[usd]", "fields[inr]",
+        "fields[try]", "fields[pln]", "fields[brl]",
+    )
+    for indexes in duplicate_groups.values():
+        if len(indexes) < 2:
+            continue
+        varied = [
+            key for key in important_fields
+            if len({str(items[i].get(key, "")) for i in indexes}) > 1
+        ]
+        if varied:
+            for index in indexes:
+                varied_by_index[index] = varied
+
+    quarantine_flags = inversion_check(items)
+    region_aliases = {
+        "россия": "Россия", "russia": "Россия", "рф": "Россия",
+        "ru": "Россия",
+        "украина": "Украина", "ukraine": "Украина",
+        "турция": "Турция", "turkey": "Турция",
+        "казахстан": "Казахстан", "kazakhstan": "Казахстан",
+        "беларусь": "Беларусь", "belarus": "Беларусь",
+        "снг": "СНГ", "cis": "СНГ",
+        "польша": "Польша", "poland": "Польша",
+        "сша": "США", "usa": "США",
+        "аргентина": "Аргентина", "argentina": "Аргентина",
+        "индия": "Индия", "india": "Индия",
+        "бразилия": "Бразилия", "brazil": "Бразилия",
+    }
+    region_pattern = re.compile(
+        r"(?<!\w)(Россия|Russia|РФ|Украина|Ukraine|Турция|Turkey|"
+        r"Казахстан|Kazakhstan|Беларусь|Belarus|Польша|Poland|США|USA|"
+        r"Аргентина|Argentina|Индия|India|Бразилия|Brazil)(?!\w)",
+        re.I,
+    )
+    columns = (
+        "dataset", "record_index", "source_index", "node_id",
+        "review_reasons", "quarantine_reason",
+        "template_candidate", "fields[method]", "fields[type]",
+        "fields[platform]", "fields[region]", "fields[region2]", "price",
+        "duplicate_variation_fields", "detected_game_ru", "detected_game_en",
+        "description_game_ru", "description_game_en", "description_product_en",
+        "fields[summary][ru]", "fields[summary][en]",
+    )
+    rows = []
+    for index, item in enumerate(items):
+        ru_title = item.get("fields[summary][ru]", "") or ""
+        en_title = item.get("fields[summary][en]", "") or ""
+        method = item.get("fields[method]", "")
+        platform = item.get("fields[platform]", "")
+        region = item.get("fields[region]", "") or item.get("fields[region2]", "")
+        game_ru = get_game_name(item, "ru")
+        game_en = get_game_name(item, "en")
+        reasons = []
+
+        if index in varied_by_index:
+            reasons.append("Совпадает ключ дедупликации, но отличаются поля: "
+                           + ", ".join(varied_by_index[index]))
+        template = route_template(item)
+        if template == "REVIEW":
+            reasons.append("Для способа продажи нет подходящего шаблона описания")
+        if not platform and not get_platform(item):
+            reasons.append("Платформа отсутствует в fields[platform] и не распознана в заголовках")
+        if game_ru == "указанный в заголовке лота товар":
+            reasons.append("Не удалось надёжно извлечь название товара из заголовков")
+        elif re.search(
+                r"быстр|безопас|достав|аккаунт|подарок|ключ|регион|"
+                r"global|steam|xbox|ps[45]|ea app",
+                game_ru, re.I):
+            reasons.append(f"В поле названия товара распознана характеристика: {game_ru}")
+        if game_en and re.search(r"[А-Яа-яЁё]", game_en):
+            reasons.append("Название товара для EN-описания содержит кириллицу")
+        if method == "Подарочная карта" and template != "6":
+            reasons.append("Подарочная карта направлена не в шаблон карты пополнения")
+        if not method and re.search(
+                r"подарочн\w+\s+карт|gift\s+card|пополнени\w+\s+по\s+(?:id|uid)|"
+                r"top.?up\s+by\s+(?:id|uid)",
+                ru_title + " " + en_title, re.I):
+            reasons.append("Способ продажи не указан в fields[method], тип товара распознан в заголовке")
+        if not region and not re.search(
+                r"(?<!\w)(?:global|any region|любой регион|снг|cis|россия|russia|"
+                r"украина|ukraine|турция|turkey|казахстан|kazakhstan|беларусь|belarus)(?!\w)",
+                ru_title + " " + en_title, re.I):
+            reasons.append("Регион отсутствует в структурированных полях и заголовке")
+
+        title_regions = {
+            region_aliases[m.group(0).casefold()]
+            for m in region_pattern.finditer(ru_title + " " + en_title)
+        }
+        region_normalized = region_aliases.get(region.casefold(), region)
+        if (len(title_regions) == 1 and region_normalized and
+                region_normalized not in ("Global", "Любой", "Любой регион") and
+                region_normalized not in title_regions):
+            reasons.append(
+                "Регион в заголовке отличается от fields[region]/fields[region2]: "
+                f"{', '.join(sorted(title_regions))} vs {region}"
+            )
+
+        non_emoji_ru = _SUMMARY_EMOJI_RE.sub("", ru_title)
+        non_emoji_en = _SUMMARY_EMOJI_RE.sub("", en_title)
+        if len(non_emoji_ru) > SUMMARY_LIMIT or len(non_emoji_en) > SUMMARY_LIMIT:
+            reasons.append("Текст заголовка длиннее лимита даже без emoji")
+
+        if reasons:
+            bucket_reason = quarantine_reason(item) or quarantine_flags.get(id(item), "")
+            rows.append({
+                "dataset": "source_dump",
+                "record_index": index,
+                "source_index": index,
+                "node_id": item.get("node_id", ""),
+                "review_reasons": " | ".join(dict.fromkeys(reasons)),
+                "quarantine_reason": bucket_reason,
+                "template_candidate": template,
+                "fields[method]": method,
+                "fields[type]": item.get("fields[type]", ""),
+                "fields[platform]": platform,
+                "fields[region]": item.get("fields[region]", ""),
+                "fields[region2]": item.get("fields[region2]", ""),
+                "price": item.get("price", ""),
+                "duplicate_variation_fields": ", ".join(varied_by_index.get(index, [])),
+                "detected_game_ru": game_ru,
+                "detected_game_en": game_en,
+                "description_game_ru": "",
+                "description_game_en": "",
+                "description_product_en": "",
+                "fields[summary][ru]": ru_title,
+                "fields[summary][en]": en_title,
+            })
+
+    for filename in (READY_FILE, QUARANTINE_FILE):
+        if not exists(filename):
+            continue
+        with open(filename, encoding="utf-8") as artifact:
+            artifact_items = json.load(artifact)
+        for index, item in enumerate(artifact_items):
+            desc_ru = item.get("fields[desc][ru]", "") or ""
+            desc_en = item.get("fields[desc][en]", "") or ""
+            game_ru_match = re.search(r"🔹\s*Игра:\s*([^\n]+)", desc_ru)
+            game_en_match = re.search(r"🔹\s*Game:\s*([^\n]+)", desc_en)
+            product_en_match = re.search(r"🔹\s*Product:\s*([^\n]+)", desc_en)
+            desc_game_ru = game_ru_match.group(1).strip() if game_ru_match else ""
+            desc_game_en = game_en_match.group(1).strip() if game_en_match else ""
+            product_en = product_en_match.group(1).strip() if product_en_match else ""
+            reasons = []
+            for lang, game in (("RU", desc_game_ru), ("EN", desc_game_en)):
+                if game and re.search(
+                        r"быстр|безопас|достав|аккаунт|подарок|ключ|регион|"
+                        r"global|steam|xbox|ps[45]|ea app|fast|safe|delivery",
+                        game, re.I):
+                    reasons.append(f"В текущем {lang}-описании в поле «Игра» указана характеристика: {game}")
+            if re.search(r"[А-Яа-яЁё]", desc_en + product_en):
+                reasons.append("В текущем EN-описании остался текст на кириллице")
+            method = item.get("fields[method]", "")
+            if method == "Подарочная карта" and re.search(
+                    r"данные для входа|login credentials|provide your login",
+                    desc_ru + " " + desc_en, re.I):
+                reasons.append("Описание подарочной карты ошибочно запрашивает данные для входа")
+            if method in ("Пополнение по ID", "Готовый аккаунт"):
+                reasons.append("Для способа продажи пока не утверждён подходящий шаблон")
+            if reasons:
+                rows.append({
+                    "dataset": filename,
+                    "record_index": index,
+                    "source_index": "",
+                    "node_id": item.get("node_id", ""),
+                    "review_reasons": " | ".join(dict.fromkeys(reasons)),
+                    "quarantine_reason": "",
+                    "template_candidate": route_template(item),
+                    "fields[method]": method,
+                    "fields[type]": item.get("fields[type]", ""),
+                    "fields[platform]": item.get("fields[platform]", ""),
+                    "fields[region]": item.get("fields[region]", ""),
+                    "fields[region2]": item.get("fields[region2]", ""),
+                    "price": item.get("price", ""),
+                    "duplicate_variation_fields": "",
+                    "detected_game_ru": get_game_name(item, "ru"),
+                    "detected_game_en": get_game_name(item, "en"),
+                    "description_game_ru": desc_game_ru,
+                    "description_game_en": desc_game_en,
+                    "description_product_en": product_en,
+                    "fields[summary][ru]": item.get("fields[summary][ru]", ""),
+                    "fields[summary][en]": item.get("fields[summary][en]", ""),
+                })
+
+    with open(path, "w", encoding="utf-8-sig", newline="") as report:
+        writer = csv.DictWriter(report, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 # ============================================================================
 # 9. ОСНОВНОЙ КОНВЕЙЕР
 # ============================================================================
@@ -1270,6 +1494,8 @@ def finalize_fields(item):
 
 def main():
     raw_items, dropped = load_dump(INPUT_FILE)
+    audit_count = write_audit_report(raw_items)
+    print(f"[AUDIT] В {AUDIT_FILE} записано записей для ручной сверки: {audit_count}")
 
     # ---- 0.5 Ротация эмодзи-палитры: таблица строится по инвентарю донора
     donor_emojis = _donor_summary_emoji_inventory(raw_items)
@@ -1283,7 +1509,6 @@ def main():
     def norm_ws(s):
         return re.sub(r"\s+", " ", s or "").strip()
 
-    seen = {}
     items = []
     removed_dups = []
     for it in raw_items:
@@ -1291,19 +1516,20 @@ def main():
            not norm_ws(it.get("fields[summary][en]")):
             removed_dups.append(("пустой лот без заголовка", it.get("node_id")))
             continue
-        key = (it.get("node_id"),
-               norm_ws(it.get("fields[summary][ru]")),
-               norm_ws(it.get("fields[region]") or it.get("fields[region2]")))
-        if key in seen:
-            removed_dups.append((norm_ws(key[1])[:60], key[0]))
-            continue
-        seen[key] = True
         items.append(it)
-    print(f"[DUP] Удалено дубликатов/пустых лотов: {len(removed_dups)}")
+    print(f"[DUP] Удалено пустых лотов: {len(removed_dups)}; "
+          "совпадающие заголовки сохранены для проверки.")
 
     # ---- 1. Специфические исправления (до трансформации заголовков) --------
     for it in items:
         apply_specific_fixes(it)
+
+    unresolved = [it for it in items if route_template(it) == "REVIEW"]
+    if unresolved:
+        raise RuntimeError(
+            f"{len(unresolved)} лотов требуют согласования шаблона описания. "
+            f"См. {AUDIT_FILE}; файлы экспорта не обновлены."
+        )
 
     # ---- 2. Карантин определяем по ИСХОДНЫМ ценам --------------------------
     inv_flags = inversion_check(items)
